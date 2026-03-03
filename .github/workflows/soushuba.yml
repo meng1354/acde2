@@ -1,4 +1,5 @@
-name: Run soushuba qiandao
+
+name: Run qiandao
 on:
   push:
   # Allows you to run this workflow manually from the Actions tab

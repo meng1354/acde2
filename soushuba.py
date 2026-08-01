@@ -80,8 +80,14 @@ class SouShuBaClient:
 
     def login_form_hash(self):
         rst = self.session.get(f'https://{self.hostname}/member.php?mod=logging&action=login', verify=False).text
-        loginhash = re.search(r'<div id="main_messaqge_(.+?)">', rst).group(1)
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
+       match = re.search(r'<div id="main_messaqge_(.+?)">', rst)
+loginhash = match.group(1) if match else None
+if not loginhash:
+    raise ValueError("Could not find loginhash in login form")
+        match = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst)
+formhash = match.group(1) if match else None
+if not formhash:
+    raise ValueError("Could not find formhash in login form")
         return loginhash, formhash
 
     def login(self):
@@ -125,7 +131,10 @@ class SouShuBaClient:
 
     def space_form_hash(self):
         rst = self.session.get(f'https://{self.hostname}/home.php', verify=False).text
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
+        match = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst)
+formhash = match.group(1) if match else None
+if not formhash:
+    raise ValueError("Could not find formhash in space form")
         return formhash
 
     def space(self):

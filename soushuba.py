@@ -9,7 +9,7 @@ from copy import copy
 
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import xml.etree.ElementTree as ET
 import time
 import logging
@@ -26,37 +26,55 @@ ch.setLevel(logging.INFO)
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
+
 def get_refresh_url(url: str):
     try:
-        response = requests.get(url)
-        if response.status_code != 403:
-            response.raise_for_status()
+        response = requests.get(url, allow_redirects=True, timeout=20)
+        # If a direct redirect happened, use response.url
+        if response.history:
+            redirect_url = response.url
+            logger.info(f"Redirecting to: {redirect_url}")
+            return redirect_url
 
+        # otherwise try to find meta refresh
         soup = BeautifulSoup(response.text, 'html.parser')
-        meta_tags = soup.find_all('meta', {'http-equiv': 'refresh'})
+        meta_tags = soup.find_all('meta', {'http-equiv': re.compile(r'(?i)refresh')})
 
         if meta_tags:
             content = meta_tags[0].get('content', '')
-            if 'url=' in content:
-                redirect_url = content.split('url=')[1].strip()
+            m = re.search(r'url=(.+)', content, flags=re.I)
+            if m:
+                redirect_url = m.group(1).strip().strip('"').strip("'")
                 logger.info(f"Redirecting to: {redirect_url}")
                 return redirect_url
         else:
             logger.error("No meta refresh tag found.")
             return None
     except Exception as e:
-        logger.exception(f'An unexpected error occurred: {e}')
+        logger.exception(f'An unexpected error occurred when getting refresh url: {e}')
         return None
 
+
 def get_url(url: str):
-    resp = requests.get(url)
-    soup = BeautifulSoup(resp.content, 'html.parser')
-    
-    links = soup.find_all('a', href=True)
-    for link in links:
-        if link.text == "搜书吧":
-            return link['href']
-    return None
+    try:
+        resp = requests.get(url, timeout=20)
+        soup = BeautifulSoup(resp.content, 'html.parser')
+
+        links = soup.find_all('a', href=True)
+        for link in links:
+            # look for link text that contains "搜书吧" (tolerant)
+            if link.text and "搜书吧" in link.text:
+                return link['href']
+        # fallback: try to find any link with hostname that looks like a site
+        for link in links:
+            href = link.get('href')
+            if href and ('soushu' in href or 'soushuba' in href):
+                return href
+        return None
+    except Exception:
+        logger.exception("Failed to get url from page")
+        return None
+
 
 class SouShuBaClient:
 
@@ -79,9 +97,38 @@ class SouShuBaClient:
         self.proxies = proxies
 
     def login_form_hash(self):
-        rst = self.session.get(f'https://{self.hostname}/member.php?mod=logging&action=login', verify=False).text
-        loginhash = re.search(r'<div id="main_messaqge_(.+?)">', rst).group(1)
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
+        rst = self.session.get(f'https://{self.hostname}/member.php?mod=logging&action=login', verify=False, timeout=20).text
+        soup = BeautifulSoup(rst, 'html.parser')
+
+        # Try to find a div id like 'main_message_<hash>' (tolerant of small typos)
+        div = soup.find('div', id=re.compile(r'^main_message_|^main_messaqge_|^main_messa?ge_', re.I))
+        loginhash = None
+        if div and div.has_attr('id'):
+            # id could be main_message_xxx
+            parts = div['id'].split('_', 1)
+            if len(parts) == 2:
+                loginhash = parts[1]
+
+        # fallback: sometimes loginhash is in javascript: search common patterns
+        if not loginhash:
+            m = re.search(r"loginhash\s*[:=]\s*[\"']([^\"']+)[\"']", rst)
+            if m:
+                loginhash = m.group(1)
+
+        # find formhash input safely
+        form_input = soup.find('input', attrs={'name': 'formhash'})
+        formhash = None
+        if form_input and form_input.get('value'):
+            formhash = form_input.get('value')
+        else:
+            m2 = re.search(r'name=["\']formhash["\']\s+value=["\'](.+?)["\']', rst)
+            if m2:
+                formhash = m2.group(1)
+
+        if not loginhash or not formhash:
+            logger.error("Failed to extract loginhash/formhash. loginhash=%r formhash=%r", loginhash, formhash)
+            raise RuntimeError("Could not find loginhash or formhash on login page; HTML structure may have changed.")
+
         return loginhash, formhash
 
     def login(self):
@@ -89,7 +136,6 @@ class SouShuBaClient:
         loginhash, formhash = self.login_form_hash()
         login_url = f'https://{self.hostname}/member.php?mod=logging&action=login&loginsubmit=yes' \
                     f'&handlekey=register&loginhash={loginhash}&inajax=1'
-
 
         headers = copy(self._common_headers)
         headers["origin"] = f'https://{self.hostname}'
@@ -103,30 +149,54 @@ class SouShuBaClient:
             'answer': self.answer
         }
 
-        resp = self.session.post(login_url, proxies=self.proxies, data=payload, headers=headers, verify=False)
+        resp = self.session.post(login_url, proxies=self.proxies, data=payload, headers=headers, verify=False, timeout=20)
         if resp.status_code == 200:
             logger.info(f'Welcome {self.username}!')
         else:
+            logger.error("Login POST returned status %s. Response snippet: %s", resp.status_code, resp.text[:300])
             raise ValueError('Verify Failed! Check your username and password!')
 
     def credit(self):
         credit_url = f"https://{self.hostname}/home.php?mod=spacecp&ac=credit&showcredit=1&inajax=1&ajaxtarget=extcreditmenu_menu"
-        credit_rst = self.session.get(credit_url, verify=False).text
+        credit_rst = self.session.get(credit_url, verify=False, timeout=20).text
 
-        # 解析 XML，提取 CDATA
-        root = ET.fromstring(str(credit_rst))
-        cdata_content = root.text
+        # Try parsing as XML then fallback to HTML parsing
+        try:
+            root = ET.fromstring(credit_rst)
+            cdata_content = root.text or ''
+            cdata_soup = BeautifulSoup(cdata_content, features="lxml")
+            span = cdata_soup.find("span", id="hcredit_2")
+            if span and span.string:
+                return span.string.strip()
+        except Exception:
+            # fallback to HTML search
+            try:
+                soup = BeautifulSoup(credit_rst, 'html.parser')
+                span = soup.find("span", id="hcredit_2")
+                if span:
+                    return (span.string or span.get_text()).strip()
+            except Exception:
+                logger.exception("Failed to parse credit response")
 
-        # 使用 BeautifulSoup 解析 CDATA 内容
-        cdata_soup = BeautifulSoup(cdata_content, features="lxml")
-        hcredit_2 = cdata_soup.find("span", id="hcredit_2").string
+        # final fallback: regex
+        m = re.search(r'<span[^>]*id=["\']hcredit_2["\'][^>]*>([^<]+)</span>', credit_rst)
+        if m:
+            return m.group(1).strip()
 
-        return hcredit_2
+        logger.warning("Could not determine credit value from response. Response snippet: %s", credit_rst[:300])
+        return None
 
     def space_form_hash(self):
-        rst = self.session.get(f'https://{self.hostname}/home.php', verify=False).text
-        formhash = re.search(r'<input type="hidden" name="formhash" value="(.+?)" />', rst).group(1)
-        return formhash
+        rst = self.session.get(f'https://{self.hostname}/home.php', verify=False, timeout=20).text
+        soup = BeautifulSoup(rst, 'html.parser')
+        input_tag = soup.find('input', attrs={'name': 'formhash'})
+        if input_tag and input_tag.get('value'):
+            return input_tag.get('value')
+        m = re.search(r'name=["\']formhash["\']\s+value=["\'](.+?)["\']', rst)
+        if m:
+            return m.group(1)
+        logger.error("Failed to extract space formhash")
+        raise RuntimeError("space formhash not found")
 
     def space(self):
         formhash = self.space_form_hash()
@@ -144,21 +214,27 @@ class SouShuBaClient:
                 "referer": "home.php",
                 "formhash": formhash
             }
-            resp = self.session.post(space_url, proxies=self.proxies, data=payload, headers=headers, verify=False)
+            resp = self.session.post(space_url, proxies=self.proxies, data=payload, headers=headers, verify=False, timeout=20)
             if re.search("操作成功", resp.text):
                 logger.info(f'{self.username} post {x + 1}nd successfully!')
                 time.sleep(120)
             else:
-                logger.warning(f'{self.username} post {x + 1}nd failed!')
+                logger.warning(f'{self.username} post {x + 1}nd failed! Response snippet: %s', resp.text[:200])
 
 
 if __name__ == '__main__':
     try:
         redirect_url = get_refresh_url('http://' + os.environ.get('SOUSHUBA_HOSTNAME', 'www.soushu2035.com'))
+        if not redirect_url:
+            raise RuntimeError("Initial redirect url not found")
         time.sleep(2)
         redirect_url2 = get_refresh_url(redirect_url)
+        if not redirect_url2:
+            raise RuntimeError("Second redirect url not found")
         url = get_url(redirect_url2)
-        logger.info(f'{url}')
+        if not url:
+            raise RuntimeError("Final target url not found from page")
+        logger.info('%s', url)
         client = SouShuBaClient(urlparse(url).hostname,
                                 os.environ.get('SOUSHUBA_USERNAME', "USERNAME"),
                                 os.environ.get('SOUSHUBA_PASSWORD', "PASSWORD"))
@@ -166,6 +242,6 @@ if __name__ == '__main__':
         client.space()
         credit = client.credit()
         logger.info(f'{client.username} have {credit} coins!')
-    except Exception as e:
-        logger.error(e)
+    except Exception:
+        logger.exception("Unhandled exception in soushuba.py")
         sys.exit(1)
